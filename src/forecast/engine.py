@@ -1,122 +1,161 @@
-"""Multi-model blending forecast engine.
+"""Three-model blend, daily outlook and complete rolling snowfall windows.
 
-Combines GFS, ECMWF, and ICON model data with confidence scoring
-to produce a single blended forecast. Tracks model accuracy over time
-to weight the most reliable source.
+Ranges show min/max of available model totals, not calibrated probabilities.
+Models are equally weighted until observed accuracy can be validated.
 """
+from collections import Counter
+from datetime import datetime, timedelta
+from math import isfinite
+from statistics import mean
+from ..config import PACIFIC, RESORTS, WEATHER_CODES
+from .models import fetch_model_data
+from ..scrapers.bachelor import fetch_conditions
 
-from datetime import datetime
-from typing import Dict, List
-from .models import fetch_model_data, fetch_resort_snow
-from .accuracy import load_accuracy_weights
-from ..config import WEATHER_CODES, FORECAST_DAYS, RESORTS
+def numeric(value):
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and isfinite(value)
 
+def summary(values):
+    valid = [v for v in values if numeric(v)]
+    return {"mean": round(mean(valid), 1), "low": round(min(valid), 1),
+            "high": round(max(valid), 1), "models": len(valid)} if valid else None
 
-def blend_forecasts(model_data: Dict, weights: Dict[str, float] = None) -> List[Dict]:
-    """Blend multiple model forecasts using weighted averaging.
+def value_at(data, key, index):
+    values = data.get(key, [])
+    return values[index] if index < len(values) else None
 
-    Args:
-        model_data: Dict of model_name -> API response
-        weights: Optional model weights from accuracy tracking
+def blend_forecasts(model_data, weights=None):
+    # Date joins prevent unequal model horizons from causing index errors.
+    by_date = {}
+    for name, payload in model_data.items():
+        if not payload:
+            continue
+        daily = payload.get("daily", {})
+        for i, timestamp in enumerate(daily.get("time", [])):
+            date = datetime.fromtimestamp(timestamp, PACIFIC).date().isoformat()
+            by_date.setdefault(date, {})[name] = {
+                field: value_at(daily, key, i) for field, key in {
+                    "temp_max": "temperature_2m_max", "temp_min": "temperature_2m_min",
+                    "snowfall": "snowfall_sum", "gust": "wind_gusts_10m_max", "code": "weather_code",
+                }.items()
+            }
+    days = []
+    for date, models in sorted(by_date.items()):
+        day = {"date": date}
+        for field in ("temp_max", "temp_min", "snowfall", "gust"):
+            day[field] = summary([m[field] for m in models.values()])
+        codes = [m["code"] for m in models.values() if numeric(m["code"])]
+        day["weather_desc"] = WEATHER_CODES.get(Counter(codes).most_common(1)[0][0], "Unknown") if codes else "Unavailable"
+        days.append(day)
+    return days
 
-    Returns:
-        List of daily forecast dicts with blended values
-    """
-    if weights is None:
-        weights = {name: 1.0 for name in model_data}
+def rolling_windows(model_data, now):
+    # Hourly snowfall is the preceding hour's accumulation. Include (start, end].
+    start = int(now.timestamp()) // 3600 * 3600
+    windows = []
+    for hours in (24, 48, 72):
+        per_model = {}
+        gusts, temps, codes = [], [], []
+        wanted = set(range(start + 3600, start + hours * 3600 + 1, 3600))
+        for name, payload in model_data.items():
+            if not payload:
+                continue
+            hourly = payload.get("hourly", {})
+            rows = {t: i for i, t in enumerate(hourly.get("time", []))}
+            if not wanted.issubset(rows):
+                continue
+            snow = [value_at(hourly, "snowfall", rows[t]) for t in sorted(wanted)]
+            if not all(numeric(v) for v in snow):
+                continue  # Never count a missing tail as zero snowfall.
+            per_model[name] = round(sum(snow), 3)
+            for t in sorted(wanted):
+                i = rows[t]
+                gusts.append(value_at(hourly, "wind_gusts_10m", i))
+                temps.append(value_at(hourly, "temperature_2m", i))
+                codes.append(value_at(hourly, "weather_code", i))
+        valid_codes = [c for c in codes if numeric(c)]
+        windows.append({
+            "hours": hours, "start": datetime.fromtimestamp(start, PACIFIC).isoformat(),
+            "end": datetime.fromtimestamp(start + hours * 3600, PACIFIC).isoformat(),
+            "snow": summary(list(per_model.values())), "by_model": per_model,
+            "gust": summary(gusts), "temperature": summary(temps),
+            "weather": WEATHER_CODES.get(Counter(valid_codes).most_common(1)[0][0], "Unknown") if valid_codes else "Unavailable",
+        })
+    return windows
 
-    # Normalize weights
-    total = sum(weights.get(m, 1.0) for m in model_data if model_data[m])
-    if total == 0:
-        total = 1.0
-
-    blended_days = []
-    active_models = {m: d for m, d in model_data.items() if d and "daily" in d}
-
-    if not active_models:
-        return []
-
-    # Use first model to determine number of days
-    first_model = next(iter(active_models.values()))
-    num_days = len(first_model["daily"].get("time", []))
-
-    for i in range(num_days):
-        day = {"date": first_model["daily"]["time"][i]}
-        fields = {
-            "temp_max": "temperature_2m_max",
-            "temp_min": "temperature_2m_min",
-            "precip": "precipitation_sum",
-            "snowfall": "snowfall_sum",
-            "wind_max": "wind_speed_10m_max",
+def build_briefing(now=None):
+    now = (now or datetime.now(PACIFIC)).astimezone(PACIFIC)
+    locations = {}
+    for point_id, point in RESORTS.items():
+        raw = fetch_model_data(point_id)
+        windows = rolling_windows(raw, now)
+        daily = blend_forecasts(raw)
+        locations[point_id] = {
+            **point, "windows": windows,
+            "daily": [d for d in daily if d["date"] >= now.date().isoformat()][:10],
+            "available_models": [name for name, data in raw.items() if data],
+            "raw": raw,
         }
+        if not windows[0]["snow"]:
+            raise RuntimeError(f"No complete next-24-hour forecast for {point['name']}; no texts sent")
+    return {"generated": now.isoformat(), "locations": locations, "conditions": fetch_conditions(now)}
 
-        for field, api_key in fields.items():
-            weighted_sum = 0
-            weight_sum = 0
-            for model_name, data in active_models.items():
-                val = data["daily"].get(api_key, [None] * num_days)[i]
-                if val is not None:
-                    w = weights.get(model_name, 1.0) / total
-                    weighted_sum += val * w
-                    weight_sum += w
-            day[field] = round(weighted_sum / weight_sum, 1) if weight_sum > 0 else None
+def snow_range(data):
+    if data is None:
+        return "unavailable"
+    if data["models"] == 1:
+        return f'{data["mean"]:.1f} in (1 model)'
+    return f'{data["low"]:.1f}–{data["high"]:.1f} in'
 
-        # Weather code: majority vote
-        codes = []
-        for model_name, data in active_models.items():
-            code = data["daily"].get("weather_code", [None] * num_days)[i]
-            if code is not None:
-                codes.append(code)
-        day["weather_code"] = max(set(codes), key=codes.count) if codes else None
-        day["weather_desc"] = WEATHER_CODES.get(day["weather_code"], "Unknown")
+def number(data, field="mean"):
+    return f'{data[field]:.0f}' if data is not None else "?"
 
-        blended_days.append(day)
-
-    return blended_days
-
-
-def format_forecast_message(resort_id: str = "mt_bachelor") -> str:
-    """Generate a formatted forecast message for SMS delivery."""
-    resort = RESORTS[resort_id]
-    model_data = fetch_model_data(resort_id)
-    weights = load_accuracy_weights()
-    forecast = blend_forecasts(model_data, weights)
-    snow = fetch_resort_snow(resort_id)
-
-    now = datetime.now()
-    lines = [f"{resort['name']} Forecast", f"{now.strftime('%a %b %d, %Y')}", ""]
-
-    # Current snow report
-    if snow:
-        lines.append("SNOW REPORT")
-        if snow.get("new_snow_24h"):
-            lines.append(f"  24hr: {snow['new_snow_24h']}\"")
-        if snow.get("new_snow_72h"):
-            lines.append(f"  72hr: {snow['new_snow_72h']}\"")
-        if snow.get("base_depth"):
-            lines.append(f"  Base: {snow['base_depth']}\"")
-        lines.append("")
-
-    # Forecast outlook
-    if forecast:
-        lines.append("FORECAST")
-        for day_idx in FORECAST_DAYS:
-            if day_idx < len(forecast):
-                d = forecast[day_idx]
-                date_str = datetime.strptime(d["date"], "%Y-%m-%d").strftime("%a %m/%d")
-                snow_str = f" | {d['snowfall']}\" snow" if d.get("snowfall") and d["snowfall"] > 0 else ""
-                lines.append(
-                    f"  {date_str}: {d.get('temp_max', '?')}°/{d.get('temp_min', '?')}° "
-                    f"{d['weather_desc']}{snow_str}"
-                )
-
-    # Model agreement
-    active = [m for m, d in model_data.items() if d]
-    lines.append(f"\nModels: {', '.join(active)}")
-
+def format_message(briefing):
+    now = datetime.fromisoformat(briefing["generated"]).astimezone(PACIFIC)
+    lines = ["POWDER ALERT · " + now.strftime("%a %b %d, %I:%M %p %Z")]
+    for point_id, point in briefing["locations"].items():
+        lines += ["", point["name"].upper()]
+        if point_id == "mt_bachelor":
+            lines.append("New snow from " + datetime.fromisoformat(point["windows"][0]["start"]).astimezone(PACIFIC).strftime("%I:%M %p %Z") + " (cumulative):")
+        else:
+            lines.append("New snow (cumulative from current hour):")
+        for window in point["windows"]:
+            lines.append(f'  {window["hours"]}h: {snow_range(window["snow"])}')
+        first = point["windows"][0]
+        lines.append(f'Next 24h: {first["weather"]}; {number(first["temperature"], "low")}–{number(first["temperature"], "high")} F; gusts up to {number(first["gust"], "high")} mph.')
+        lines.append("Models: " + ", ".join(point["available_models"]))
+    conditions = briefing["conditions"]
+    lines += ["", "BACHELOR RESORT REPORT"]
+    snow = conditions["snow"]
+    if snow and not snow["stale"]:
+        lines.append(f'Reported 24h snow: {snow["new_snow_24h"] if snow["new_snow_24h"] is not None else "?"} in; base: {snow["base_depth"] if snow["base_depth"] is not None else "?"} in.')
+        lines.append("Snow report dated " + snow["updated"])
+    else:
+        lines.append("Snow report unavailable or older than 36h.")
+    lifts = conditions["lifts"]
+    fresh_lifts = [lift for lift in lifts if not lift["stale"]]
+    if fresh_lifts:
+        counts = Counter(lift["status"] for lift in fresh_lifts)
+        lines.append("Lift feed: " + ", ".join(f"{count} {status}" for status, count in sorted(counts.items())))
+        for lift in fresh_lifts:
+            lines.append(f'  {lift["name"]}: {lift["status"]} (updated {lift["updated"]})')
+    if len(fresh_lifts) != len(lifts) or not lifts:
+        lines.append("Some/all lift updates unavailable or older than 36h; check resort report.")
+    lines.append("Checked " + datetime.fromisoformat(conditions["checked"]).astimezone(PACIFIC).strftime("%I:%M %p %Z"))
+    lines.append(conditions["source"])
+    for point in briefing["locations"].values():
+        lines += ["", point["name"].upper() + " · 10-DAY OUTLOOK"]
+        for day in point["daily"]:
+            date = datetime.fromisoformat(day["date"]).strftime("%a %m/%d")
+            lines.append(f'{date}: {day["weather_desc"]}, {number(day["temp_min"])}–{number(day["temp_max"])} F; snow {snow_range(day["snowfall"])}')
+    lines += ["", "Snow ranges = model spread, not probability bounds. Fewer models at longer leads.",
+              "Daily totals use Pacific calendar days; 24/48/72h totals use rolling hours.",
+              "Mountain values are base-elevation forecasts; winds aloft may differ.",
+              "Data: Open-Meteo (CC BY 4.0) · https://open-meteo.com/ · Mt. Bachelor",
+              "Local personal forecast; verify resort operations before leaving."]
     return "\n".join(lines)
 
+def format_forecast_message(resort_id="mt_bachelor"):
+    return format_message(build_briefing())
 
 if __name__ == "__main__":
-    msg = format_forecast_message()
-    print(msg)
+    print(format_forecast_message())

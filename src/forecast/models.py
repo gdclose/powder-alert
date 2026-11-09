@@ -1,64 +1,48 @@
-"""Fetch forecast data from multiple weather models via Open-Meteo API."""
-
-import requests
-from typing import Dict, Optional
+"""Open-Meteo model data, with explicit elevation, units and bounded retries."""
+import json
+import logging
+import time
+from urllib.error import HTTPError, URLError
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
 from ..config import MODELS, RESORTS
 
+log = logging.getLogger(__name__)
 
-def fetch_model_data(resort_id: str = "mt_bachelor") -> Dict:
-    """Fetch forecast data from all configured weather models.
-
-    Returns dict keyed by model name with hourly/daily forecast data.
-    """
-    resort = RESORTS[resort_id]
-    url = "https://api.open-meteo.com/v1/forecast"
-    model_data = {}
-
-    for model_name, model_id in MODELS.items():
-        params = {
-            "latitude": resort["lat"],
-            "longitude": resort["lon"],
-            "models": model_id,
-            "hourly": "temperature_2m,precipitation,snowfall,wind_speed_10m,wind_direction_10m,weather_code",
-            "daily": "temperature_2m_max,temperature_2m_min,precipitation_sum,snowfall_sum,wind_speed_10m_max,weather_code",
-            "temperature_unit": "fahrenheit",
-            "wind_speed_unit": "mph",
-            "precipitation_unit": "inch",
-            "forecast_days": 14,
-            "timezone": "America/Los_Angeles",
-        }
-
+def get_json(url, params=None):
+    if params:
+        url += "?" + urlencode(params)
+    for attempt in range(3):
         try:
-            resp = requests.get(url, params=params, timeout=15)
-            resp.raise_for_status()
-            model_data[model_name] = resp.json()
-        except requests.RequestException as e:
-            print(f"Failed to fetch {model_name}: {e}")
-            model_data[model_name] = None
+            request = Request(url, headers={"User-Agent": "PowderAlert/1.0 (personal forecast)"})
+            with urlopen(request, timeout=20) as response:
+                return json.load(response)
+        except (HTTPError, URLError, TimeoutError, ValueError) as exc:
+            if isinstance(exc, HTTPError) and exc.code not in (429, 500, 502, 503, 504):
+                raise
+            if attempt == 2:
+                raise
+            time.sleep(2 ** attempt)
 
-    return model_data
-
-
-def fetch_resort_snow(resort_id: str = "mt_bachelor") -> Optional[Dict]:
-    """Fetch current snow report from resort API."""
-    resort = RESORTS[resort_id]
-    api_url = resort.get("cms_api")
-    if not api_url:
-        return None
-
-    try:
-        resp = requests.get(api_url, timeout=10)
-        resp.raise_for_status()
-        data = resp.json()
-        if data.get("data"):
-            attrs = data["data"][0].get("attributes", {})
-            return {
-                "new_snow_12h": attrs.get("field_new_snow_12_hours"),
-                "new_snow_24h": attrs.get("field_new_snow_24_hours"),
-                "new_snow_72h": attrs.get("field_new_snow_72_hours"),
-                "base_depth": attrs.get("field_base_depth"),
-                "season_total": attrs.get("field_season_snowfall"),
-            }
-    except requests.RequestException:
-        pass
-    return None
+def fetch_model_data(resort_id="mt_bachelor"):
+    point = RESORTS[resort_id]
+    result = {}
+    for name, model in MODELS.items():
+        params = {
+            "latitude": point["lat"], "longitude": point["lon"],
+            "elevation": point["elevation"], "models": model,
+            "hourly": "temperature_2m,snowfall,wind_speed_10m,wind_gusts_10m,weather_code",
+            "daily": "temperature_2m_max,temperature_2m_min,snowfall_sum,wind_gusts_10m_max,weather_code",
+            "temperature_unit": "fahrenheit", "wind_speed_unit": "mph",
+            "precipitation_unit": "inch", "forecast_days": 11,
+            "timezone": "America/Los_Angeles", "timeformat": "unixtime",
+        }
+        try:
+            data = get_json("https://api.open-meteo.com/v1/forecast", params)
+            if not isinstance(data.get("hourly"), dict) or not isinstance(data.get("daily"), dict):
+                raise ValueError("Missing hourly or daily forecast")
+            result[name] = data
+        except (OSError, ValueError, TypeError) as exc:
+            log.warning("%s %s unavailable: %s", resort_id, name, exc)
+            result[name] = None
+    return result
