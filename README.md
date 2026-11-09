@@ -5,7 +5,7 @@ Runs on your Mac and submits messages through Apple's Messages app. No Twilio,
 cloud hosting, API keys, subscriptions or pip packages required. Your mobile
 carrier's normal messaging terms still apply to SMS.
 
-## Included
+The daily text is a compact briefing: Bachelor snow windows, weather, resort summary,\n10-day snow signals and a one-line Bend forecast. Full daily tables and lift timestamps\nstay in the local dashboard. Use `python3 -m src.cli --detailed` for a full terminal preview.\n\n## Included
 
 - Equal-weight GFS / ECMWF / ICON blend from Open-Meteo.
 - New snow through 24 / 48 / 72 hours, starting at the current hour, for
@@ -101,7 +101,7 @@ AppleScript service support varies with macOS and carrier setup; actual
 iMessage/SMS delivery needs this Mac test. If SMS service is unavailable, fix
 iPhone forwarding or switch Apple recipients to iMessage.
 
-The briefing includes both 10-day outlooks and may span multiple SMS segments.
+The compact briefing may still span multiple SMS segments.
 It is one text submission per recipient, not a group text.
 
 ## 4. Enable daily sending

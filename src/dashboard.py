@@ -2,7 +2,7 @@
 from html import escape
 from datetime import datetime
 from .config import PACIFIC
-from .forecast.engine import format_message, snow_range, number
+from .forecast.engine import format_detailed_message, snow_range, number
 
 def render_dashboard(briefing):
     cards = []
@@ -44,4 +44,4 @@ span,p{font-size:14px;line-height:1.6}.scroll{overflow:auto}table{width:100%;bor
 th,td{padding:12px;border-bottom:1px solid #d3ded8;white-space:nowrap}th{font-size:12px}
 details{background:white;padding:20px;border-radius:12px}pre{white-space:pre-wrap;overflow-wrap:anywhere;font:14px/1.7 system-ui}
 a{color:#215a46}footer{padding:24px 0;font-size:13px}@media(max-width:650px){body{padding:18px}.cards{grid-template-columns:1fr}article{padding:16px}}
-</style><header><div class="eyebrow">POWDER ALERT / PERSONAL EDITION</div><h1>Your mountain morning.</h1><p>""" + escape(updated) + """ · Snapshot; does not auto-refresh.</p></header>""" + "".join(cards) + lifts + '<details><summary>Full text briefing</summary><pre>' + escape(format_message(briefing)) + """</pre></details><footer>Weather: <a href="https://open-meteo.com/">Open-Meteo</a> · CC BY 4.0. Resort conditions: Mt. Bachelor.<br>Model spread is not a calibrated probability interval. Forecasts and resort reports can change.</footer></html>"""
+</style><header><div class="eyebrow">POWDER ALERT / PERSONAL EDITION</div><h1>Your mountain morning.</h1><p>""" + escape(updated) + """ · Snapshot; does not auto-refresh.</p></header>""" + "".join(cards) + lifts + '<details><summary>Full text briefing</summary><pre>' + escape(format_detailed_message(briefing)) + """</pre></details><footer>Weather: <a href="https://open-meteo.com/">Open-Meteo</a> · CC BY 4.0. Resort conditions: Mt. Bachelor.<br>Model spread is not a calibrated probability interval. Forecasts and resort reports can change.</footer></html>"""

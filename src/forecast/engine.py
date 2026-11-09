@@ -102,14 +102,21 @@ def build_briefing(now=None):
 def snow_range(data):
     if data is None:
         return "unavailable"
+    def amount(value):
+        # Some models return tiny negative floating-point snow amounts.
+        return f"{max(0, value):.1f}".rstrip("0").rstrip(".")
+    low, high = amount(data["low"]), amount(data["high"])
+    text = low if low == high else low + "–" + high
     if data["models"] == 1:
-        return f'{data["mean"]:.1f} in (1 model)'
-    return f'{data["low"]:.1f}–{data["high"]:.1f} in'
+        text = amount(data["mean"]) + " in (1 model)"
+    else:
+        text += " in"
+    return text
 
 def number(data, field="mean"):
     return f'{data[field]:.0f}' if data is not None else "?"
 
-def format_message(briefing):
+def format_detailed_message(briefing):
     now = datetime.fromisoformat(briefing["generated"]).astimezone(PACIFIC)
     lines = ["POWDER ALERT · " + now.strftime("%a %b %d, %I:%M %p %Z")]
     for point_id, point in briefing["locations"].items():
@@ -152,6 +159,83 @@ def format_message(briefing):
               "Mountain values are base-elevation forecasts; winds aloft may differ.",
               "Data: Open-Meteo (CC BY 4.0) · https://open-meteo.com/ · Mt. Bachelor",
               "Local personal forecast; verify resort operations before leaving."]
+    return "\n".join(lines)
+
+def outlook_signal(point):
+    days = point["daily"]
+    available = [d for d in days if d["snowfall"] is not None]
+    if not available:
+        return "10-day: outlook unavailable."
+    # A simple signal from model means, not a ski-quality recommendation.
+    signals = [i for i, day in enumerate(days)
+               if day["snowfall"] and day["snowfall"]["mean"] >= 0.5]
+    if not signals:
+        return "10-day: limited snow signal in the model blend."
+    groups = []
+    for index in signals:
+        if groups and index == groups[-1][-1] + 1:
+            groups[-1].append(index)
+        else:
+            groups.append([index])
+    labels = []
+    for group in groups:
+        def label(index):
+            return datetime.fromisoformat(days[index]["date"]).strftime("%a %-m/%-d")
+        labels.append(label(group[0]) if len(group) == 1 else
+                      label(group[0]) + "–" + label(group[-1]))
+    return "10-day snow signals: " + ", ".join(labels) + "."
+
+def format_message(briefing):
+    """Compact phone briefing; the dashboard retains the full daily tables."""
+    now = datetime.fromisoformat(briefing["generated"]).astimezone(PACIFIC)
+    mountain = briefing["locations"]["mt_bachelor"]
+    bend = briefing["locations"]["bend"]
+    first = mountain["windows"][0]
+    start = datetime.fromisoformat(first["start"]).astimezone(PACIFIC)
+    lines = [
+        "🏔 POWDER ALERT",
+        now.strftime("%a %b %-d · %-I:%M %p %Z"),
+        "",
+        "BACHELOR · BASE",
+        f'{first["weather"]} · {number(first["temperature"], "low")}–{number(first["temperature"], "high")}°F',
+        "Snow 24 / 48 / 72h: " + " / ".join(
+            snow_range(w["snow"]).replace(" in", "″") for w in mountain["windows"]),
+        "Cumulative from " + start.strftime("%-I:%M %p %Z") + " · model ranges",
+        f'Gusts up to {number(first["gust"], "high")} mph' +
+        (" ⚠" if first["gust"] and first["gust"]["high"] >= 45 else ""),
+    ]
+    conditions = briefing["conditions"]
+    snow = conditions["snow"]
+    if snow and not snow["stale"]:
+        def reported(value):
+            try:
+                return f"{max(0, float(value)):g}"
+            except (TypeError, ValueError):
+                return "?"
+        stamp = datetime.fromisoformat(snow["updated"]).astimezone(PACIFIC).strftime("%-m/%-d %-I:%M %p")
+        lines.append(f'Resort snow: {reported(snow["new_snow_24h"])}″ past 24h · {reported(snow["base_depth"])}″ base (as of {stamp})')
+    else:
+        lines.append("Resort snow: report pending/stale.")
+    lifts = conditions["lifts"]
+    current = [lift for lift in lifts if not lift["stale"]]
+    if current:
+        counts = Counter(lift["status"] for lift in current)
+        status = " · ".join(f"{count} {name}" for name, count in sorted(counts.items()))
+        if len(current) < len(lifts):
+            status += " · others stale"
+        lines.append("Lifts: " + status + ".")
+    else:
+        lines.append("Lifts: awaiting a fresh resort update.")
+    lines += [outlook_signal(mountain), "", "BEND · 97703"]
+    near = bend["windows"][0]
+    lines.append(f'{near["weather"]} · {number(near["temperature"], "low")}–{number(near["temperature"], "high")}°F · gusts {number(near["gust"], "high")} mph')
+    if all(w["snow"] and w["snow"]["high"] == 0 for w in bend["windows"]):
+        lines.append("No new snow in the next 72h model blend.")
+    else:
+        lines.append("Snow 24 / 48 / 72h: " + " / ".join(
+            snow_range(w["snow"]).replace(" in", "″") for w in bend["windows"]))
+    lines += ["", "Full outlook + lift details in your local dashboard.",
+              "Weather: Open-Meteo (CC BY 4.0) · open-meteo.com · Resort: Mt. Bachelor"]
     return "\n".join(lines)
 
 def format_forecast_message(resort_id="mt_bachelor"):

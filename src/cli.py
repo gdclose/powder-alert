@@ -14,7 +14,7 @@ import sys
 
 from .config import CONFIG_FILE, DATA_DIR, PACIFIC
 from .delivery.sms import normalize_number, send_sms
-from .forecast.engine import build_briefing, format_message
+from .forecast.engine import build_briefing, format_message, format_detailed_message
 from .dashboard import render_dashboard
 
 def write_json(path, data):
@@ -151,6 +151,7 @@ def main():
     parser.add_argument("command", nargs="?", choices=["preview", "configure", "doctor"], default="preview")
     parser.add_argument("--config", type=Path, default=CONFIG_FILE)
     parser.add_argument("--output-dir", type=Path, default=DATA_DIR)
+    parser.add_argument("--detailed", action="store_true", help="Print the full daily tables in preview mode")
     parser.add_argument("--send", action="store_true", help="Actually submit texts to configured recipients")
     parser.add_argument("--scheduled", action="store_true", help="Only send during configured morning window")
     args = parser.parse_args()
@@ -190,7 +191,7 @@ def main():
                 return 1 if deliver(format_message(briefing), config["recipients"], state_path, now) else 0
         briefing = build_briefing(now)
         save_outputs(briefing, args.output_dir, now)
-        print(format_message(briefing))
+        print(format_detailed_message(briefing) if args.detailed else format_message(briefing))
         print("\nPreview only. Dashboard: " + str(args.output_dir / "dashboard.html"))
         return 0
     except (OSError, ValueError, RuntimeError, subprocess.TimeoutExpired) as exc:

@@ -8,7 +8,7 @@ import unittest
 from unittest.mock import patch
 
 from src.config import PACIFIC
-from src.forecast.engine import rolling_windows, blend_forecasts, format_message
+from src.forecast.engine import rolling_windows, blend_forecasts, format_message, format_detailed_message, snow_range, outlook_signal
 from src.delivery.sms import normalize_number, send_sms, SCRIPT
 from src.scrapers.bachelor import parse_snow, parse_lifts
 from src.cli import deliver, due, load_config, main
@@ -157,6 +157,45 @@ class DeliveryTests(unittest.TestCase):
         self.assertEqual(data["ProgramArguments"][0],"/Users/Test User/powder-alert/.venv/bin/python")
         self.assertEqual(data["StartCalendarInterval"],{"Hour":7,"Minute":15})
         self.assertTrue(data["RunAtLoad"])
+
+
+class MessageTests(unittest.TestCase):
+    def briefing(self):
+        models = {"GFS": {**hourly(72, 0), **daily(10, [0,0,0,0,1,2,3,0,0,0])}}
+        point = {"name": "Mt. Bachelor · base", "windows": rolling_windows(models, NOW),
+                 "daily": blend_forecasts(models), "available_models": ["GFS"]}
+        return {"generated": NOW.isoformat(),
+                "locations": {"mt_bachelor": point, "bend": {**point, "name": "Bend · 97703"}},
+                "conditions": {"checked": NOW.isoformat(), "source": "https://www.mtbachelor.com/",
+                               "snow": None, "lifts": []}}
+
+    def test_zero_snow_is_clean_and_units_unambiguous(self):
+        self.assertEqual(snow_range({"low":-0.0,"high":0.0,"mean":0,"models":3}), "0 in")
+        self.assertEqual(snow_range({"low":0,"high":1,"mean":0.5,"models":3}), "0–1 in")
+
+    def test_compact_text_and_detailed_dashboard(self):
+        briefing = self.briefing()
+        compact, detailed = format_message(briefing), format_detailed_message(briefing)
+        self.assertLess(len(compact), len(detailed) * 0.55)
+        self.assertIn("24 / 48 / 72h", compact)
+        self.assertIn("BEND · 97703", compact)
+        self.assertNotIn("2026-01-01T", compact)
+        self.assertIn("10-DAY OUTLOOK", render_dashboard(briefing))
+        self.assertIn("2026-01-10", render_dashboard(briefing))
+
+    def test_missing_snow_is_not_reported_as_no_snow(self):
+        briefing = self.briefing()
+        briefing["locations"]["bend"]["windows"] = [
+            {**window, "snow": None} for window in briefing["locations"]["bend"]["windows"]]
+        message = format_message(briefing)
+        self.assertIn("unavailable", message)
+        self.assertNotIn("No new snow", message)
+
+    def test_snow_signal_groups_and_missing_outlook(self):
+        point = self.briefing()["locations"]["mt_bachelor"]
+        self.assertIn("Mon 1/5–Wed 1/7", outlook_signal(point))
+        point["daily"] = []
+        self.assertIn("unavailable", outlook_signal(point))
 
 if __name__ == "__main__":
     unittest.main()
