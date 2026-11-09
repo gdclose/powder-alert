@@ -8,7 +8,7 @@ import unittest
 from unittest.mock import patch
 
 from src.config import PACIFIC
-from src.forecast.engine import rolling_windows, blend_forecasts, format_message, format_detailed_message, snow_range, outlook_signal
+from src.forecast.engine import rolling_windows, blend_forecasts, format_message, format_detailed_message, snow_range, outlook_signal, window_snow_total
 from src.delivery.sms import normalize_number, send_sms, SCRIPT
 from src.scrapers.bachelor import parse_snow, parse_lifts
 from src.cli import deliver, due, load_config, main
@@ -177,7 +177,11 @@ class MessageTests(unittest.TestCase):
         briefing = self.briefing()
         compact, detailed = format_message(briefing), format_detailed_message(briefing)
         self.assertLess(len(compact), len(detailed) * 0.55)
-        self.assertIn("24 / 48 / 72h", compact)
+        self.assertIn("Next 24h:", compact)
+        self.assertIn("Next 48h:", compact)
+        self.assertIn("Next 72h:", compact)
+        self.assertNotIn("24 / 48 / 72h", compact)
+        self.assertLess(compact.index("cumulative from"), compact.index("Next 24h:"))
         self.assertIn("BEND · 97703", compact)
         self.assertNotIn("2026-01-01T", compact)
         self.assertIn("10-DAY OUTLOOK", render_dashboard(briefing))
@@ -196,6 +200,37 @@ class MessageTests(unittest.TestCase):
         self.assertIn("Mon 1/5–Wed 1/7", outlook_signal(point))
         point["daily"] = []
         self.assertIn("unavailable", outlook_signal(point))
+
+
+    def test_window_total_sums_models_not_daily_ranges(self):
+        days = [
+            {"snow_by_model": {"GFS": 1, "ECMWF": 9}},
+            {"snow_by_model": {"GFS": 9, "ECMWF": 1}},
+        ]
+        total = window_snow_total(days)
+        self.assertEqual(total, {"mean": 10, "low": 10, "high": 10, "models": 2})
+
+    def test_window_total_excludes_short_model_horizon(self):
+        days = [
+            {"snow_by_model": {"GFS": 2, "ECMWF": 3, "ICON": 15}},
+            {"snow_by_model": {"GFS": 4, "ECMWF": 7}},
+        ]
+        self.assertEqual(window_snow_total(days), {"mean": 8, "low": 6, "high": 10, "models": 2})
+        days[1]["snow_by_model"] = {"ICON": None}
+        self.assertIsNone(window_snow_total(days))
+
+    def test_snow_signal_shows_total_for_its_dates(self):
+        point = self.briefing()["locations"]["mt_bachelor"]
+        message = outlook_signal(point)
+        self.assertIn("Mon 1/5–Wed 1/7 · 6″ (1 model) projected total", message)
+        self.assertIn("10-DAY SNOW SIGNAL", message)
+
+    def test_daily_snow_retains_unrounded_per_model_totals(self):
+        days = blend_forecasts({"GFS": daily(2, [0.444, -0.00001]),
+                                "ECMWF": daily(2, [0.555, 2])})
+        self.assertEqual(days[0]["snow_by_model"]["GFS"], 0.444)
+        self.assertEqual(days[1]["snow_by_model"]["GFS"], 0)
+        self.assertEqual(window_snow_total(days)["high"], 2.6)
 
 if __name__ == "__main__":
     unittest.main()
