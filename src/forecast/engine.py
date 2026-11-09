@@ -40,7 +40,10 @@ def blend_forecasts(model_data, weights=None):
             }
     days = []
     for date, models in sorted(by_date.items()):
-        day = {"date": date}
+        day = {"date": date, "snow_by_model": {
+            name: max(0, model["snowfall"]) for name, model in models.items()
+            if numeric(model["snowfall"])
+        }}
         for field in ("temp_max", "temp_min", "snowfall", "gust"):
             day[field] = summary([m[field] for m in models.values()])
         codes = [m["code"] for m in models.values() if numeric(m["code"])]
@@ -161,6 +164,31 @@ def format_detailed_message(briefing):
               "Local personal forecast; verify resort operations before leaving."]
     return "\n".join(lines)
 
+def window_snow_total(days):
+    """Sum each model over the whole date window before taking the spread.
+
+    Models with missing days are excluded; adding daily min/max would combine
+    different model trajectories into misleading cumulative bounds.
+    """
+    if not days:
+        return None
+    complete = set(days[0].get("snow_by_model", {}))
+    for day in days:
+        complete &= {name for name, value in day.get("snow_by_model", {}).items()
+                     if numeric(value)}
+    totals = [sum(max(0, day["snow_by_model"][name]) for day in days)
+              for name in sorted(complete)]
+    return summary(totals)
+
+def snow_windows_text(point, start=None):
+    heading = "New snow · cumulative"
+    if start is not None:
+        heading += " from " + start.strftime("%-I:%M %p %Z")
+    return [heading] + [
+        f'Next {w["hours"]}h: ' + snow_range(w["snow"]).replace(" in", "″")
+        for w in point["windows"]
+    ]
+
 def outlook_signal(point):
     days = point["daily"]
     available = [d for d in days if d["snowfall"] is not None]
@@ -173,7 +201,9 @@ def outlook_signal(point):
         return "10-day: limited snow signal in the model blend."
     groups = []
     for index in signals:
-        if groups and index == groups[-1][-1] + 1:
+        if (groups and index == groups[-1][-1] + 1 and
+                datetime.fromisoformat(days[index]["date"]) -
+                datetime.fromisoformat(days[groups[-1][-1]]["date"]) == timedelta(days=1)):
             groups[-1].append(index)
         else:
             groups.append([index])
@@ -181,9 +211,13 @@ def outlook_signal(point):
     for group in groups:
         def label(index):
             return datetime.fromisoformat(days[index]["date"]).strftime("%a %-m/%-d")
-        labels.append(label(group[0]) if len(group) == 1 else
-                      label(group[0]) + "–" + label(group[-1]))
-    return "10-day snow signals: " + ", ".join(labels) + "."
+        dates = label(group[0]) if len(group) == 1 else label(group[0]) + "–" + label(group[-1])
+        total = window_snow_total([days[index] for index in group])
+        amount = snow_range(total).replace(" in", "″")
+        # For a single model, snow_range already labels the limitation.
+        count = f' ({total["models"]} models)' if total and total["models"] > 1 else ""
+        labels.append(dates + " · " + amount + " projected total" + count)
+    return "10-DAY SNOW SIGNAL\n" + "\n".join(labels)
 
 def format_message(briefing):
     """Compact phone briefing; the dashboard retains the full daily tables."""
@@ -198,9 +232,7 @@ def format_message(briefing):
         "",
         "BACHELOR · BASE",
         f'{first["weather"]} · {number(first["temperature"], "low")}–{number(first["temperature"], "high")}°F',
-        "Snow 24 / 48 / 72h: " + " / ".join(
-            snow_range(w["snow"]).replace(" in", "″") for w in mountain["windows"]),
-        "Cumulative from " + start.strftime("%-I:%M %p %Z") + " · model ranges",
+        *snow_windows_text(mountain, start),
         f'Gusts up to {number(first["gust"], "high")} mph' +
         (" ⚠" if first["gust"] and first["gust"]["high"] >= 45 else ""),
     ]
@@ -226,14 +258,13 @@ def format_message(briefing):
         lines.append("Lifts: " + status + ".")
     else:
         lines.append("Lifts: awaiting a fresh resort update.")
-    lines += [outlook_signal(mountain), "", "BEND · 97703"]
+    lines += ["", outlook_signal(mountain), "", "BEND · 97703"]
     near = bend["windows"][0]
     lines.append(f'{near["weather"]} · {number(near["temperature"], "low")}–{number(near["temperature"], "high")}°F · gusts {number(near["gust"], "high")} mph')
     if all(w["snow"] and w["snow"]["high"] == 0 for w in bend["windows"]):
         lines.append("No new snow in the next 72h model blend.")
     else:
-        lines.append("Snow 24 / 48 / 72h: " + " / ".join(
-            snow_range(w["snow"]).replace(" in", "″") for w in bend["windows"]))
+        lines.extend(snow_windows_text(bend, start))
     lines += ["", "Full outlook + lift details in your local dashboard.",
               "Weather: Open-Meteo (CC BY 4.0) · open-meteo.com · Resort: Mt. Bachelor"]
     return "\n".join(lines)
